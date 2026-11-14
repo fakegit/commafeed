@@ -1,0 +1,296 @@
+name: ci
+permissions:
+  contents: read
+
+on:
+  push:
+  pull_request:
+
+env:
+  JAVA_VERSION: 25
+  DOCKER_BUILD_SUMMARY: false
+
+jobs:
+  build:
+    if: github.event_name != 'pull_request' || github.actor != 'renovate[bot]' # renovate already triggers the build on pushes
+
+    strategy:
+      matrix:
+        os: [ "ubuntu-24.04", "ubuntu-22.04-arm", "windows-latest" ]
+        database: [ "h2", "postgresql", "mysql", "mariadb" ]
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # Setup
+      - name: Set up GraalVM
+        uses: graalvm/setup-graalvm@d6eca2595046623d69d636041513c80abf745406 # v1.6.9
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: "mandrel"
+          cache: "maven"
+
+      - name: Set up NodeJS cache
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          cache: "npm"
+          cache-dependency-path: 'commafeed-client/package-lock.json'
+
+      - name: Install Playwright dependencies
+        run: sudo apt-get install -y libgbm1
+        if: matrix.os != 'windows-latest'
+
+      # Build & Test
+      - name: Build with Maven
+        run: mvn --batch-mode --no-transfer-progress install -Pnative -P${{ matrix.database }} -DskipITs=${{ matrix.os == 'windows-latest' && matrix.database != 'h2' }}
+
+      # Build pages
+      - name: Create pages directory structure
+        run: mkdir -p target/pages/documentation/custom-css
+
+      - name: Convert readme file to html
+        uses: jaywcjlove/markdown-to-html-cli@cff9330af4ca8048b197a76d9eb1db189c2a7cee # v5.0.4
+        with:
+          source: README.md
+          output: target/pages/index.html
+
+      - name: Convert config documentation to html
+        uses: jaywcjlove/markdown-to-html-cli@cff9330af4ca8048b197a76d9eb1db189c2a7cee # v5.0.4
+        with:
+          source: commafeed-server/target/quarkus-generated-doc/config/commafeed-server.md
+          output: target/pages/documentation/index.html
+
+      - name: Convert custom css documentation to html
+        uses: jaywcjlove/markdown-to-html-cli@cff9330af4ca8048b197a76d9eb1db189c2a7cee # v5.0.4
+        with:
+          source: documentation/CUSTOMCSS.md
+          output: target/pages/documentation/custom-css/index.html
+
+      # Upload artifacts
+      - name: Upload cross-platform app
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: matrix.os == 'ubuntu-24.04' # we only need to upload the cross-platform artifact once per database
+        with:
+          name: commafeed-${{ matrix.database }}-jvm
+          path: commafeed-server/target/commafeed-*.zip
+
+      - name: Upload native executable
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: commafeed-${{ matrix.database }}-${{ runner.os }}-${{ runner.arch }}
+          path: commafeed-server/target/commafeed-*-runner*
+
+      - name: Upload pages
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: matrix.os == 'ubuntu-24.04' && matrix.database == 'h2' # we only need to upload the pages once
+        with:
+          path: target/pages
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: build
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
+    strategy:
+      matrix:
+        database: [ "h2", "postgresql", "mysql", "mariadb" ]
+
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # Setup
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Install required packages
+        run: sudo apt-get install -y rename unzip
+
+      # Prepare artifacts
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: commafeed-${{ matrix.database }}-*
+          path: ./artifacts
+          merge-multiple: true
+
+      - name: Set the exec flag on the native executables
+        run: chmod +x artifacts/*-runner
+
+      - name: Rename native executables to match buildx TARGETARCH
+        run: |
+          rename 's/x86_64/amd64/g' artifacts/*
+          rename 's/aarch_64/arm64/g' artifacts/*
+
+      - name: Unzip jvm package
+        run: |
+          unzip artifacts/*-jvm.zip -d artifacts/extracted-jvm-package
+          rename 's/commafeed-.*/quarkus-app/g' artifacts/extracted-jvm-package/*
+
+      # Docker
+      - name: Login to Container Registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        if: ${{ env.DOCKERHUB_USERNAME != '' }}
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: athou/commafeed
+
+      ## build but don't push for PRs and renovate
+      - name: Docker build - native
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: commafeed-server/src/main/docker/Dockerfile.native
+          push: false
+          platforms: linux/amd64,linux/arm64/v8
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Docker build - jvm
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: commafeed-server/src/main/docker/Dockerfile.jvm
+          push: false
+          platforms: linux/amd64,linux/arm64/v8
+          labels: ${{ steps.meta.outputs.labels }}
+
+      ## build and push tag
+      - name: Docker build and push tag - native
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        if: ${{ github.ref_type == 'tag' }}
+        with:
+          context: .
+          file: commafeed-server/src/main/docker/Dockerfile.native
+          push: ${{ env.DOCKERHUB_USERNAME != '' }}
+          platforms: linux/amd64,linux/arm64/v8
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            athou/commafeed:latest-${{ matrix.database }}
+            athou/commafeed:${{ github.ref_name }}-${{ matrix.database }}
+
+      - name: Docker build and push tag - jvm
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        if: ${{ github.ref_type == 'tag' }}
+        with:
+          context: .
+          file: commafeed-server/src/main/docker/Dockerfile.jvm
+          push: ${{ env.DOCKERHUB_USERNAME != '' }}
+          platforms: linux/amd64,linux/arm64/v8
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            athou/commafeed:latest-${{ matrix.database }}-jvm
+            athou/commafeed:${{ github.ref_name }}-${{ matrix.database }}-jvm
+
+      ## build and push master
+      - name: Docker build and push master - native
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        if: ${{ github.ref_name == 'master' }}
+        with:
+          context: .
+          file: commafeed-server/src/main/docker/Dockerfile.native
+          push: ${{ env.DOCKERHUB_USERNAME != '' }}
+          platforms: linux/amd64,linux/arm64/v8
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: athou/commafeed:master-${{ matrix.database }}
+
+      - name: Docker build and push master - jvm
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        if: ${{ github.ref_name == 'master' }}
+        with:
+          context: .
+          file: commafeed-server/src/main/docker/Dockerfile.jvm
+          push: ${{ env.DOCKERHUB_USERNAME != '' }}
+          platforms: linux/amd64,linux/arm64/v8
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: athou/commafeed:master-${{ matrix.database }}-jvm
+
+  release:
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - docker
+    permissions:
+      contents: write
+    if: github.ref_type == 'tag'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: commafeed-*
+          path: ./artifacts
+          merge-multiple: true
+
+      - name: Set the exec flag on the native executables
+        run: chmod +x artifacts/*-runner
+
+      - name: Extract Changelog Entry
+        uses: mindsers/changelog-reader-action@1faaf50aa09d5793d9a100819973df801febfb31 # v2.4.0
+        id: changelog_reader
+        with:
+          version: ${{ github.ref_name }}
+
+      - name: Create GitHub release
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
+        with:
+          name: CommaFeed ${{ github.ref_name }}
+          body: ${{ steps.changelog_reader.outputs.changes }}
+          artifacts: ./artifacts/*
+
+
+  update-dockerhub-description:
+    runs-on: ubuntu-latest
+    needs: release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Update Docker Hub Description
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: athou/commafeed
+          short-description: ${{ github.event.repository.description }}
+          readme-filepath: commafeed-server/src/main/docker/README.md
+
+
+  deploy-pages:
+    runs-on: ubuntu-latest
+    needs: release
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+        id: deployment

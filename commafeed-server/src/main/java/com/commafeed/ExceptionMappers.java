@@ -1,0 +1,86 @@
+package com.commafeed;
+
+import com.commafeed.frontend.exception.CommaFeedApplicationException;
+import com.commafeed.frontend.exception.CommaFeedExceptionType;
+import com.commafeed.security.CookieService;
+
+import io.quarkus.runtime.annotations.RegisterForReflection;
+import io.quarkus.security.AuthenticationFailedException;
+import io.quarkus.security.UnauthorizedException;
+
+import jakarta.annotation.Priority;
+import jakarta.validation.ValidationException;
+import jakarta.ws.rs.core.HttpHeaders;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.NewCookie;
+import jakarta.ws.rs.core.UriInfo;
+import jakarta.ws.rs.ext.Provider;
+
+import lombok.RequiredArgsConstructor;
+
+import org.jboss.resteasy.reactive.RestResponse;
+import org.jboss.resteasy.reactive.RestResponse.ResponseBuilder;
+import org.jboss.resteasy.reactive.RestResponse.Status;
+import org.jboss.resteasy.reactive.server.ServerExceptionMapper;
+
+@RequiredArgsConstructor
+@Provider
+@Priority(1)
+public class ExceptionMappers {
+
+    private final CookieService cookieService;
+    private final CommaFeedConfiguration config;
+
+    @ServerExceptionMapper(CommaFeedApplicationException.class)
+    public RestResponse<CommaFeedApplicationError> applicationError(CommaFeedApplicationException e) {
+        ResponseBuilder<CommaFeedApplicationError> response =
+                ResponseBuilder.create(e.type().status(), new CommaFeedApplicationError(e.type(), e.getMessage()));
+        if (e.type().status() == Status.UNAUTHORIZED) {
+            response.cookie(cookieService.buildLogoutCookie());
+        }
+        return response.build();
+    }
+
+    @ServerExceptionMapper(UnauthorizedException.class)
+    public RestResponse<UnauthorizedResponse> unauthorized(UnauthorizedException e) {
+        return RestResponse.status(
+                Status.UNAUTHORIZED, new UnauthorizedResponse(e.getMessage(), config.users().allowRegistrations()));
+    }
+
+    @ServerExceptionMapper(AuthenticationFailedException.class)
+    public RestResponse<AuthenticationFailed> authenticationFailed(
+            AuthenticationFailedException e, HttpHeaders headers, UriInfo uriInfo) {
+        NewCookie logoutCookie = cookieService.buildLogoutCookie();
+
+        // a browser navigating with an invalidated session would otherwise display the error
+        // instead of the page, retry the request now that the cookie is removed
+        if (headers.getAcceptableMediaTypes().stream()
+                .anyMatch(m -> MediaType.TEXT_HTML_TYPE.isCompatible(m) && !m.isWildcardType())) {
+            return ResponseBuilder.<AuthenticationFailed>create(Status.TEMPORARY_REDIRECT)
+                    .location(uriInfo.getRequestUri())
+                    .cookie(logoutCookie)
+                    .build();
+        }
+
+        return ResponseBuilder.create(Status.UNAUTHORIZED, new AuthenticationFailed(e.getMessage()))
+                .cookie(logoutCookie)
+                .build();
+    }
+
+    @ServerExceptionMapper(ValidationException.class)
+    public RestResponse<ValidationFailed> validationFailed(ValidationException e) {
+        return RestResponse.status(Status.BAD_REQUEST, new ValidationFailed(e.getMessage()));
+    }
+
+    @RegisterForReflection
+    public record UnauthorizedResponse(String message, boolean allowRegistrations) {}
+
+    @RegisterForReflection
+    public record AuthenticationFailed(String message) {}
+
+    @RegisterForReflection
+    public record ValidationFailed(String message) {}
+
+    @RegisterForReflection
+    public record CommaFeedApplicationError(CommaFeedExceptionType type, String message) {}
+}
